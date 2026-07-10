@@ -31,17 +31,16 @@ from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_WHITE_LEVEL = 245       # pixel considered "white" if all channels >= this
 DEFAULT_COL_BLANK_FRAC = 0.995  # column is a separator if >= this fraction white
-DEFAULT_ROW_BLANK_FRAC = 0.995  # row is a separator if >= this fraction white
 DEFAULT_MIN_COL_SEPARATOR = 3   # minimum consecutive blank cols to count as a column separator
-# Row (grid-row) separators must be wider than the small white gaps that occur
-# *between lines of text inside a single cell* (e.g. the gap between a bold
-# timestamp line and the description line below it), otherwise multi-line
-# captions get mistaken for extra grid rows. Keep this comfortably larger
-# than a typical inter-line gap; tune via --min-row-separator if a batch's
-# line spacing is unusually wide/narrow.
-DEFAULT_MIN_ROW_SEPARATOR = 10
-DEFAULT_TEXT_WHITE_FRAC = 0.55  # within a cell, row considered "text band" if white frac >= this
-DEFAULT_TEXT_RUN = 8            # consecutive rows needed at/above threshold to confirm text-area start
+# Rows are NOT assumed to have any white gap between them (many real storyboard
+# grids butt the next screenshot directly against the previous row's caption,
+# with only *columns* separated by whitespace). Row boundaries are therefore
+# found by scanning the full image width top-to-bottom for sustained
+# transitions between "screenshot" (low white fraction) and "white caption
+# background" (high white fraction) -- see compute_row_segments().
+DEFAULT_TEXT_WHITE_FRAC = 0.55  # row considered "caption band" if white frac >= this
+DEFAULT_TEXT_RUN = 8            # consecutive rows needed at/above threshold to confirm caption-area start
+DEFAULT_IMAGE_RUN = 8           # consecutive rows needed below threshold to confirm next row's image start
 DEFAULT_CELL_BLANK_FRAC = 0.995  # whole cell considered "no cell here" if this white fraction
 
 
@@ -104,13 +103,6 @@ def detect_columns(gray: np.ndarray, white_level, col_blank_frac, min_col_separa
     return find_bands(is_blank_col, min_col_separator)
 
 
-def detect_rows(gray: np.ndarray, white_level, row_blank_frac, min_row_separator):
-    is_white = gray >= white_level
-    row_white_frac = is_white.mean(axis=1)
-    is_blank_row = row_white_frac >= row_blank_frac
-    return find_bands(is_blank_row, min_row_separator)
-
-
 def cell_is_empty(gray: np.ndarray, y0, y1, x0, x1, white_level, cell_blank_frac):
     sub = gray[y0:y1, x0:x1]
     if sub.size == 0:
@@ -119,35 +111,74 @@ def cell_is_empty(gray: np.ndarray, y0, y1, x0, x1, white_level, cell_blank_frac
     return white_frac >= cell_blank_frac
 
 
-def find_text_split(gray: np.ndarray, y0, y1, x0, x1, white_level, text_white_frac, text_run):
-    """Within a cell's y-range [y0,y1) and x-range [x0,x1), find the y where
-    the image area ends and the white-background text area begins. Returns an
-    absolute y coordinate. Falls back to y1 (no text area detected) if no
-    sustained white run is found."""
-    sub = gray[y0:y1, x0:x1]
-    if sub.shape[0] == 0:
-        return y1
-    is_white = sub >= white_level
+def compute_row_segments(gray: np.ndarray, white_level, text_white_frac, text_run, image_run,
+                          x0=None, x1=None):
+    """Find grid-row boundaries by scanning top-to-bottom within x-range
+    [x0, x1) (defaults to the full image width), without assuming any blank
+    gap between rows. Each row is: a screenshot band (low white fraction)
+    immediately followed by a caption band (high white fraction, sustained
+    for `text_run` rows) that runs until the next row's screenshot begins
+    (white fraction drops and stays low for `image_run` rows). Handles both
+    zero-gap grids and grids with a genuine blank gutter between rows (the
+    gutter just becomes part of the caption band, which is harmless for
+    cropping/OCR).
+
+    Returns a list of dicts: {y0, y1, split_y} in row order."""
+    height, width = gray.shape
+    if x0 is None:
+        x0 = 0
+    if x1 is None:
+        x1 = width
+    is_white = gray[:, x0:x1] >= white_level
     row_white_frac = is_white.mean(axis=1)
 
-    run = 0
-    for i, frac in enumerate(row_white_frac):
-        if frac >= text_white_frac:
-            run += 1
-            if run >= text_run:
-                return y0 + (i - run + 1)
-        else:
-            run = 0
-    return y1  # no clear text band found; treat whole cell as image
+    segments = []
+    pos = 0
+    while pos < height:
+        split_y = None
+        run = 0
+        for y in range(pos, height):
+            if row_white_frac[y] >= text_white_frac:
+                run += 1
+                if run >= text_run:
+                    split_y = y - run + 1
+                    break
+            else:
+                run = 0
+
+        if split_y is None:
+            # no caption band found; treat the rest as a single image-only row
+            segments.append({"y0": pos, "y1": height, "split_y": height})
+            break
+
+        next_image_start = None
+        run = 0
+        for y in range(split_y, height):
+            if row_white_frac[y] < text_white_frac:
+                run += 1
+                if run >= image_run:
+                    next_image_start = y - run + 1
+                    break
+            else:
+                run = 0
+
+        if next_image_start is None:
+            # rest of the image is caption/blank; this is the last row
+            segments.append({"y0": pos, "y1": height, "split_y": split_y})
+            break
+
+        segments.append({"y0": pos, "y1": next_image_start, "split_y": split_y})
+        pos = next_image_start
+
+    return [s for s in segments if s["y1"] - s["y0"] > 2]
 
 
 def detect_grid(image: Image.Image, white_level=DEFAULT_WHITE_LEVEL,
                  col_blank_frac=DEFAULT_COL_BLANK_FRAC,
-                 row_blank_frac=DEFAULT_ROW_BLANK_FRAC,
                  min_col_separator=DEFAULT_MIN_COL_SEPARATOR,
-                 min_row_separator=DEFAULT_MIN_ROW_SEPARATOR,
                  text_white_frac=DEFAULT_TEXT_WHITE_FRAC,
                  text_run=DEFAULT_TEXT_RUN,
+                 image_run=DEFAULT_IMAGE_RUN,
                  cell_blank_frac=DEFAULT_CELL_BLANK_FRAC):
     """Detect grid cells in row-major order. Returns list[Cell] with row/col
     set to their position in the detected grid (row 0-indexed top to bottom,
@@ -157,14 +188,25 @@ def detect_grid(image: Image.Image, white_level=DEFAULT_WHITE_LEVEL,
     gray = to_gray(arr)
 
     col_bands = detect_columns(gray, white_level, col_blank_frac, min_col_separator)
-    row_bands = detect_rows(gray, white_level, row_blank_frac, min_row_separator)
+
+    # Row boundaries are detected per-column and the column yielding the most
+    # rows is used as the canonical row structure. This matters when the last
+    # row is incomplete (fewer cells than other rows): a column that happens
+    # to be blank in that final row would otherwise terminate its scan early
+    # and miss the row entirely, while a column that *does* have a cell there
+    # correctly reports the full row count.
+    candidate_segments = [
+        compute_row_segments(gray, white_level, text_white_frac, text_run, image_run, x0=cx0, x1=cx1)
+        for (cx0, cx1) in col_bands
+    ]
+    row_segments = max(candidate_segments, key=len, default=[])
 
     cells = []
-    for r, (y0, y1) in enumerate(row_bands):
+    for r, seg in enumerate(row_segments):
+        y0, y1, split_y = seg["y0"], seg["y1"], seg["split_y"]
         for c, (x0, x1) in enumerate(col_bands):
             if cell_is_empty(gray, y0, y1, x0, x1, white_level, cell_blank_frac):
                 continue
-            split_y = find_text_split(gray, y0, y1, x0, x1, white_level, text_white_frac, text_run)
             img_box = (x0, y0, x1, split_y)
             text_box = (x0, split_y, x1, y1)
             cells.append(Cell(row=r, col=c, img_box=img_box, text_box=text_box))
@@ -284,11 +326,10 @@ def build_thresholds(args):
     return dict(
         white_level=args.white_level,
         col_blank_frac=args.col_blank_frac,
-        row_blank_frac=args.row_blank_frac,
         min_col_separator=args.min_col_separator,
-        min_row_separator=args.min_row_separator,
         text_white_frac=args.text_white_frac,
         text_run=args.text_run,
+        image_run=args.image_run,
         cell_blank_frac=args.cell_blank_frac,
     )
 
@@ -307,11 +348,10 @@ def main():
 
     parser.add_argument("--white-level", type=int, default=DEFAULT_WHITE_LEVEL)
     parser.add_argument("--col-blank-frac", type=float, default=DEFAULT_COL_BLANK_FRAC)
-    parser.add_argument("--row-blank-frac", type=float, default=DEFAULT_ROW_BLANK_FRAC)
     parser.add_argument("--min-col-separator", type=int, default=DEFAULT_MIN_COL_SEPARATOR)
-    parser.add_argument("--min-row-separator", type=int, default=DEFAULT_MIN_ROW_SEPARATOR)
     parser.add_argument("--text-white-frac", type=float, default=DEFAULT_TEXT_WHITE_FRAC)
     parser.add_argument("--text-run", type=int, default=DEFAULT_TEXT_RUN)
+    parser.add_argument("--image-run", type=int, default=DEFAULT_IMAGE_RUN)
     parser.add_argument("--cell-blank-frac", type=float, default=DEFAULT_CELL_BLANK_FRAC)
 
     args = parser.parse_args()
