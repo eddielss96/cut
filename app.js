@@ -122,11 +122,10 @@ function readThresholds() {
   return {
     whiteLevel: Number(document.getElementById("p-white-level").value),
     colBlankFrac: Number(document.getElementById("p-col-blank-frac").value),
-    rowBlankFrac: Number(document.getElementById("p-row-blank-frac").value),
     minColSeparator: Number(document.getElementById("p-min-col-separator").value),
-    minRowSeparator: Number(document.getElementById("p-min-row-separator").value),
     textWhiteFrac: Number(document.getElementById("p-text-white-frac").value),
     textRun: Number(document.getElementById("p-text-run").value),
+    imageRun: Number(document.getElementById("p-image-run").value),
     cellBlankFrac: Number(document.getElementById("p-cell-blank-frac").value),
   };
 }
@@ -180,19 +179,6 @@ function detectColumns(gray, width, height, whiteLevel, colBlankFrac, minColSepa
   return findBands(isBlankCol, minColSeparator);
 }
 
-function detectRows(gray, width, height, whiteLevel, rowBlankFrac, minRowSeparator) {
-  const isBlankRow = new Array(height);
-  for (let y = 0; y < height; y++) {
-    let whiteCount = 0;
-    const rowOffset = y * width;
-    for (let x = 0; x < width; x++) {
-      if (gray[rowOffset + x] >= whiteLevel) whiteCount++;
-    }
-    isBlankRow[y] = whiteCount / width >= rowBlankFrac;
-  }
-  return findBands(isBlankRow, minRowSeparator);
-}
-
 function cellIsEmpty(gray, width, y0, y1, x0, x1, whiteLevel, cellBlankFrac) {
   const area = (y1 - y0) * (x1 - x0);
   if (area <= 0) return true;
@@ -206,41 +192,93 @@ function cellIsEmpty(gray, width, y0, y1, x0, x1, whiteLevel, cellBlankFrac) {
   return whiteCount / area >= cellBlankFrac;
 }
 
-function findTextSplit(gray, width, y0, y1, x0, x1, whiteLevel, textWhiteFrac, textRun) {
-  const cellWidth = x1 - x0;
-  if (y1 - y0 <= 0 || cellWidth <= 0) return y1;
-  let run = 0;
-  for (let y = y0; y < y1; y++) {
+// Row boundaries are NOT assumed to have any white gap between them (many
+// real storyboard grids butt the next screenshot directly against the
+// previous row's caption, with only *columns* separated by whitespace).
+// Instead, scan top-to-bottom within [x0, x1) for sustained transitions
+// between "screenshot" (low white fraction) and "white caption background"
+// (high white fraction, sustained for `textRun` rows), then back to the next
+// row's screenshot (sustained for `imageRun` rows). This also transparently
+// handles grids that *do* have a blank gutter between rows: the gutter just
+// becomes part of the caption band, which is harmless for cropping/OCR.
+function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageRun, x0, x1) {
+  const rowWhiteFrac = new Float32Array(height);
+  const colCount = x1 - x0;
+  for (let y = 0; y < height; y++) {
     let whiteCount = 0;
     const rowOffset = y * width;
     for (let x = x0; x < x1; x++) {
       if (gray[rowOffset + x] >= whiteLevel) whiteCount++;
     }
-    const frac = whiteCount / cellWidth;
-    if (frac >= textWhiteFrac) {
-      run++;
-      if (run >= textRun) return y - run + 1;
-    } else {
-      run = 0;
-    }
+    rowWhiteFrac[y] = whiteCount / colCount;
   }
-  return y1;
+
+  const segments = [];
+  let pos = 0;
+  while (pos < height) {
+    let splitY = null;
+    let run = 0;
+    for (let y = pos; y < height; y++) {
+      if (rowWhiteFrac[y] >= textWhiteFrac) {
+        run++;
+        if (run >= textRun) { splitY = y - run + 1; break; }
+      } else {
+        run = 0;
+      }
+    }
+
+    if (splitY === null) {
+      segments.push({ y0: pos, y1: height, splitY: height });
+      break;
+    }
+
+    let nextImageStart = null;
+    run = 0;
+    for (let y = splitY; y < height; y++) {
+      if (rowWhiteFrac[y] < textWhiteFrac) {
+        run++;
+        if (run >= imageRun) { nextImageStart = y - run + 1; break; }
+      } else {
+        run = 0;
+      }
+    }
+
+    if (nextImageStart === null) {
+      segments.push({ y0: pos, y1: height, splitY });
+      break;
+    }
+
+    segments.push({ y0: pos, y1: nextImageStart, splitY });
+    pos = nextImageStart;
+  }
+
+  return segments.filter(s => s.y1 - s.y0 > 2);
 }
 
 function detectGrid(imageData, thresholds) {
   const { width, height } = imageData;
   const gray = toGray(imageData);
-  const { whiteLevel, colBlankFrac, rowBlankFrac, minColSeparator, minRowSeparator,
-    textWhiteFrac, textRun, cellBlankFrac } = thresholds;
+  const { whiteLevel, colBlankFrac, minColSeparator,
+    textWhiteFrac, textRun, imageRun, cellBlankFrac } = thresholds;
 
   const colBands = detectColumns(gray, width, height, whiteLevel, colBlankFrac, minColSeparator);
-  const rowBands = detectRows(gray, width, height, whiteLevel, rowBlankFrac, minRowSeparator);
+
+  // Row boundaries are detected per-column and the column yielding the most
+  // rows is used as the canonical row structure. This matters when the last
+  // row is incomplete (fewer cells than other rows): a column that happens
+  // to be blank in that final row would otherwise terminate its scan early
+  // and miss the row entirely, while a column that *does* have a cell there
+  // correctly reports the full row count.
+  let rowSegments = [];
+  for (const [cx0, cx1] of colBands) {
+    const candidate = computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageRun, cx0, cx1);
+    if (candidate.length > rowSegments.length) rowSegments = candidate;
+  }
 
   const cells = [];
-  rowBands.forEach(([y0, y1], r) => {
+  rowSegments.forEach(({ y0, y1, splitY }, r) => {
     colBands.forEach(([x0, x1], c) => {
       if (cellIsEmpty(gray, width, y0, y1, x0, x1, whiteLevel, cellBlankFrac)) return;
-      const splitY = findTextSplit(gray, width, y0, y1, x0, x1, whiteLevel, textWhiteFrac, textRun);
       cells.push({
         row: r,
         col: c,
