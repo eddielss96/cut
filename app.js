@@ -125,6 +125,7 @@ function readThresholds() {
     minColSeparator: Number(document.getElementById("p-min-col-separator").value),
     textWhiteFrac: Number(document.getElementById("p-text-white-frac").value),
     textRun: Number(document.getElementById("p-text-run").value),
+    imageWhiteFrac: Number(document.getElementById("p-image-white-frac").value),
     imageRun: Number(document.getElementById("p-image-run").value),
   };
 }
@@ -182,12 +183,20 @@ function detectColumns(gray, width, height, whiteLevel, colBlankFrac, minColSepa
 // real storyboard grids butt the next screenshot directly against the
 // previous row's caption, with only *columns* separated by whitespace).
 // Instead, scan top-to-bottom within [x0, x1) for sustained transitions
-// between "screenshot" (low white fraction) and "white caption background"
-// (high white fraction, sustained for `textRun` rows), then back to the next
-// row's screenshot (sustained for `imageRun` rows). This also transparently
-// handles grids that *do* have a blank gutter between rows: the gutter just
-// becomes part of the caption band, which is harmless for cropping/OCR.
-function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageRun, x0, x1) {
+// between "screenshot" (white frac sustained below imageWhiteFrac for
+// imageRun rows) and "white caption background" (white frac sustained at/
+// above textWhiteFrac for textRun rows). This also transparently handles
+// grids that *do* have a blank gutter between rows: the gutter just becomes
+// part of the caption band, which is harmless for cropping/OCR.
+//
+// Two separate thresholds (hysteresis) are used rather than one: dense or
+// bold multi-line captions can have individual rows whose white fraction
+// dips well below textWhiteFrac (e.g. a heavy justified line), which would
+// otherwise be mistaken for the next row's screenshot starting early and
+// cut the caption in half. Confirming a real screenshot start requires the
+// fraction to stay below the *stricter*, lower imageWhiteFrac -- real
+// photos are almost always far below that bar, while dense text rarely is.
+function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageWhiteFrac, imageRun, x0, x1) {
   const rowWhiteFrac = new Float32Array(height);
   const colCount = x1 - x0;
   for (let y = 0; y < height; y++) {
@@ -199,6 +208,19 @@ function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, text
     rowWhiteFrac[y] = whiteCount / colCount;
   }
 
+  function findImageStart(fromY) {
+    let run = 0;
+    for (let y = fromY; y < height; y++) {
+      if (rowWhiteFrac[y] < imageWhiteFrac) {
+        run++;
+        if (run >= imageRun) return y - run + 1;
+      } else {
+        run = 0;
+      }
+    }
+    return null;
+  }
+
   const segments = [];
   let pos = 0;
   while (pos < height) {
@@ -206,10 +228,7 @@ function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, text
     // blank/white margin first (e.g. the outer padding above the very first
     // row) so it isn't mistaken for a zero-height row whose "caption" is
     // really just that margin.
-    let imgStart = null;
-    for (let y = pos; y < height; y++) {
-      if (rowWhiteFrac[y] < textWhiteFrac) { imgStart = y; break; }
-    }
+    const imgStart = findImageStart(pos);
     if (imgStart === null) break; // nothing but blank/white remains
 
     let splitY = null;
@@ -228,16 +247,7 @@ function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, text
       break;
     }
 
-    let nextImageStart = null;
-    run = 0;
-    for (let y = splitY; y < height; y++) {
-      if (rowWhiteFrac[y] < textWhiteFrac) {
-        run++;
-        if (run >= imageRun) { nextImageStart = y - run + 1; break; }
-      } else {
-        run = 0;
-      }
-    }
+    const nextImageStart = findImageStart(splitY);
 
     if (nextImageStart === null) {
       segments.push({ y0: imgStart, y1: height, splitY });
@@ -265,11 +275,11 @@ function detectGrid(imageData, thresholds) {
   const { width, height } = imageData;
   const gray = toGray(imageData);
   const { whiteLevel, colBlankFrac, minColSeparator,
-    textWhiteFrac, textRun, imageRun } = thresholds;
+    textWhiteFrac, textRun, imageWhiteFrac, imageRun } = thresholds;
 
   const colBands = detectColumns(gray, width, height, whiteLevel, colBlankFrac, minColSeparator);
   const columnSegments = colBands.map(([cx0, cx1]) =>
-    computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageRun, cx0, cx1)
+    computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageWhiteFrac, imageRun, cx0, cx1)
   );
   const nRows = Math.max(0, ...columnSegments.map(segs => segs.length));
 
