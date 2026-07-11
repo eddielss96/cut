@@ -126,7 +126,6 @@ function readThresholds() {
     textWhiteFrac: Number(document.getElementById("p-text-white-frac").value),
     textRun: Number(document.getElementById("p-text-run").value),
     imageRun: Number(document.getElementById("p-image-run").value),
-    cellBlankFrac: Number(document.getElementById("p-cell-blank-frac").value),
   };
 }
 
@@ -179,19 +178,6 @@ function detectColumns(gray, width, height, whiteLevel, colBlankFrac, minColSepa
   return findBands(isBlankCol, minColSeparator);
 }
 
-function cellIsEmpty(gray, width, y0, y1, x0, x1, whiteLevel, cellBlankFrac) {
-  const area = (y1 - y0) * (x1 - x0);
-  if (area <= 0) return true;
-  let whiteCount = 0;
-  for (let y = y0; y < y1; y++) {
-    const rowOffset = y * width;
-    for (let x = x0; x < x1; x++) {
-      if (gray[rowOffset + x] >= whiteLevel) whiteCount++;
-    }
-  }
-  return whiteCount / area >= cellBlankFrac;
-}
-
 // Row boundaries are NOT assumed to have any white gap between them (many
 // real storyboard grids butt the next screenshot directly against the
 // previous row's caption, with only *columns* separated by whitespace).
@@ -216,9 +202,19 @@ function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, text
   const segments = [];
   let pos = 0;
   while (pos < height) {
+    // A row must start with actual screenshot content. Skip any leading
+    // blank/white margin first (e.g. the outer padding above the very first
+    // row) so it isn't mistaken for a zero-height row whose "caption" is
+    // really just that margin.
+    let imgStart = null;
+    for (let y = pos; y < height; y++) {
+      if (rowWhiteFrac[y] < textWhiteFrac) { imgStart = y; break; }
+    }
+    if (imgStart === null) break; // nothing but blank/white remains
+
     let splitY = null;
     let run = 0;
-    for (let y = pos; y < height; y++) {
+    for (let y = imgStart; y < height; y++) {
       if (rowWhiteFrac[y] >= textWhiteFrac) {
         run++;
         if (run >= textRun) { splitY = y - run + 1; break; }
@@ -228,7 +224,7 @@ function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, text
     }
 
     if (splitY === null) {
-      segments.push({ y0: pos, y1: height, splitY: height });
+      segments.push({ y0: imgStart, y1: height, splitY: height });
       break;
     }
 
@@ -244,41 +240,45 @@ function computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, text
     }
 
     if (nextImageStart === null) {
-      segments.push({ y0: pos, y1: height, splitY });
+      segments.push({ y0: imgStart, y1: height, splitY });
       break;
     }
 
-    segments.push({ y0: pos, y1: nextImageStart, splitY });
+    segments.push({ y0: imgStart, y1: nextImageStart, splitY });
     pos = nextImageStart;
   }
 
   return segments.filter(s => s.y1 - s.y0 > 2);
 }
 
+// Columns are detected once from the whole image (they share a consistent
+// white gutter), but each column's cells are then found *independently* by
+// scanning that column's own vertical strip top-to-bottom. This matters
+// because real storyboard grids are not always a rigid table: caption
+// length varies per cell, so one column's row boundaries commonly do not
+// line up with another column's -- forcing shared row coordinates across
+// columns would crop into the wrong cell's content. "Row" here is only a
+// reading-order index (top-to-bottom position within a column), not a
+// shared y-coordinate. A short last row (fewer cells than other rows) is
+// handled naturally: that column's scan just yields one fewer segment.
 function detectGrid(imageData, thresholds) {
   const { width, height } = imageData;
   const gray = toGray(imageData);
   const { whiteLevel, colBlankFrac, minColSeparator,
-    textWhiteFrac, textRun, imageRun, cellBlankFrac } = thresholds;
+    textWhiteFrac, textRun, imageRun } = thresholds;
 
   const colBands = detectColumns(gray, width, height, whiteLevel, colBlankFrac, minColSeparator);
-
-  // Row boundaries are detected per-column and the column yielding the most
-  // rows is used as the canonical row structure. This matters when the last
-  // row is incomplete (fewer cells than other rows): a column that happens
-  // to be blank in that final row would otherwise terminate its scan early
-  // and miss the row entirely, while a column that *does* have a cell there
-  // correctly reports the full row count.
-  let rowSegments = [];
-  for (const [cx0, cx1] of colBands) {
-    const candidate = computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageRun, cx0, cx1);
-    if (candidate.length > rowSegments.length) rowSegments = candidate;
-  }
+  const columnSegments = colBands.map(([cx0, cx1]) =>
+    computeRowSegments(gray, width, height, whiteLevel, textWhiteFrac, textRun, imageRun, cx0, cx1)
+  );
+  const nRows = Math.max(0, ...columnSegments.map(segs => segs.length));
 
   const cells = [];
-  rowSegments.forEach(({ y0, y1, splitY }, r) => {
+  for (let r = 0; r < nRows; r++) {
     colBands.forEach(([x0, x1], c) => {
-      if (cellIsEmpty(gray, width, y0, y1, x0, x1, whiteLevel, cellBlankFrac)) return;
+      const segs = columnSegments[c];
+      if (r >= segs.length) return;
+      const { y0, y1, splitY } = segs[r];
       cells.push({
         row: r,
         col: c,
@@ -286,7 +286,7 @@ function detectGrid(imageData, thresholds) {
         textBox: [x0, splitY, x1, y1],
       });
     });
-  });
+  }
   return cells;
 }
 
