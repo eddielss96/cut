@@ -38,10 +38,17 @@ DEFAULT_MIN_COL_SEPARATOR = 3   # minimum consecutive blank cols to count as a c
 # found by scanning the full image width top-to-bottom for sustained
 # transitions between "screenshot" (low white fraction) and "white caption
 # background" (high white fraction) -- see compute_row_segments().
-DEFAULT_TEXT_WHITE_FRAC = 0.55  # row considered "caption band" if white frac >= this
+DEFAULT_TEXT_WHITE_FRAC = 0.5    # row considered "caption band" if white frac >= this
+# Confirming that a *new* row's screenshot has begun uses a stricter (lower)
+# threshold than entering the caption band. Dense/bold multi-line captions
+# can have individual rows whose white fraction dips well below
+# TEXT_WHITE_FRAC (e.g. a heavy justified line), which would otherwise be
+# mistaken for the next row's image starting early, cutting the caption
+# text in half. Real screenshots are almost always far below this stricter
+# bar, so the two-threshold (hysteresis) design tells them apart reliably.
+DEFAULT_IMAGE_WHITE_FRAC = 0.25
 DEFAULT_TEXT_RUN = 8            # consecutive rows needed at/above threshold to confirm caption-area start
-DEFAULT_IMAGE_RUN = 8           # consecutive rows needed below threshold to confirm next row's image start
-DEFAULT_CELL_BLANK_FRAC = 0.995  # whole cell considered "no cell here" if this white fraction
+DEFAULT_IMAGE_RUN = 10          # consecutive rows needed below threshold to confirm next row's image start
 
 
 @dataclass
@@ -103,25 +110,25 @@ def detect_columns(gray: np.ndarray, white_level, col_blank_frac, min_col_separa
     return find_bands(is_blank_col, min_col_separator)
 
 
-def cell_is_empty(gray: np.ndarray, y0, y1, x0, x1, white_level, cell_blank_frac):
-    sub = gray[y0:y1, x0:x1]
-    if sub.size == 0:
-        return True
-    white_frac = (sub >= white_level).mean()
-    return white_frac >= cell_blank_frac
-
-
-def compute_row_segments(gray: np.ndarray, white_level, text_white_frac, text_run, image_run,
-                          x0=None, x1=None):
+def compute_row_segments(gray: np.ndarray, white_level, text_white_frac, text_run,
+                          image_white_frac, image_run, x0=None, x1=None):
     """Find grid-row boundaries by scanning top-to-bottom within x-range
     [x0, x1) (defaults to the full image width), without assuming any blank
-    gap between rows. Each row is: a screenshot band (low white fraction)
-    immediately followed by a caption band (high white fraction, sustained
-    for `text_run` rows) that runs until the next row's screenshot begins
-    (white fraction drops and stays low for `image_run` rows). Handles both
-    zero-gap grids and grids with a genuine blank gutter between rows (the
-    gutter just becomes part of the caption band, which is harmless for
+    gap between rows. Each row is: a screenshot band (white frac sustained
+    below `image_white_frac` for `image_run` rows) immediately followed by a
+    caption band (white frac sustained at/above `text_white_frac` for
+    `text_run` rows) that runs until the next row's screenshot is confirmed.
+    Handles both zero-gap grids and grids with a genuine blank gutter between
+    rows (the gutter just becomes part of the caption band, harmless for
     cropping/OCR).
+
+    Two separate thresholds (hysteresis) are used rather than one: dense or
+    bold multi-line captions can have individual rows whose white fraction
+    dips well below `text_white_frac`, which would otherwise be mistaken for
+    the next row's screenshot starting early and cut the caption in half.
+    Confirming a real screenshot start requires the fraction to stay below
+    the *stricter*, lower `image_white_frac` -- real photos are almost always
+    far below that bar, while dense text rarely is.
 
     Returns a list of dicts: {y0, y1, split_y} in row order."""
     height, width = gray.shape
@@ -132,12 +139,33 @@ def compute_row_segments(gray: np.ndarray, white_level, text_white_frac, text_ru
     is_white = gray[:, x0:x1] >= white_level
     row_white_frac = is_white.mean(axis=1)
 
+    def find_image_start(from_y):
+        """First y >= from_y where white frac stays below image_white_frac
+        for image_run consecutive rows (a confirmed screenshot start)."""
+        run = 0
+        for y in range(from_y, height):
+            if row_white_frac[y] < image_white_frac:
+                run += 1
+                if run >= image_run:
+                    return y - run + 1
+            else:
+                run = 0
+        return None
+
     segments = []
     pos = 0
     while pos < height:
+        # A row must start with actual screenshot content. Skip any leading
+        # blank/white margin first (e.g. the outer padding above the very
+        # first row) so it isn't mistaken for a zero-height row whose
+        # "caption" is really just that margin.
+        img_start = find_image_start(pos)
+        if img_start is None:
+            break  # nothing but blank/white remains
+
         split_y = None
         run = 0
-        for y in range(pos, height):
+        for y in range(img_start, height):
             if row_white_frac[y] >= text_white_frac:
                 run += 1
                 if run >= text_run:
@@ -148,26 +176,17 @@ def compute_row_segments(gray: np.ndarray, white_level, text_white_frac, text_ru
 
         if split_y is None:
             # no caption band found; treat the rest as a single image-only row
-            segments.append({"y0": pos, "y1": height, "split_y": height})
+            segments.append({"y0": img_start, "y1": height, "split_y": height})
             break
 
-        next_image_start = None
-        run = 0
-        for y in range(split_y, height):
-            if row_white_frac[y] < text_white_frac:
-                run += 1
-                if run >= image_run:
-                    next_image_start = y - run + 1
-                    break
-            else:
-                run = 0
+        next_image_start = find_image_start(split_y)
 
         if next_image_start is None:
             # rest of the image is caption/blank; this is the last row
-            segments.append({"y0": pos, "y1": height, "split_y": split_y})
+            segments.append({"y0": img_start, "y1": height, "split_y": split_y})
             break
 
-        segments.append({"y0": pos, "y1": next_image_start, "split_y": split_y})
+        segments.append({"y0": img_start, "y1": next_image_start, "split_y": split_y})
         pos = next_image_start
 
     return [s for s in segments if s["y1"] - s["y0"] > 2]
@@ -178,35 +197,40 @@ def detect_grid(image: Image.Image, white_level=DEFAULT_WHITE_LEVEL,
                  min_col_separator=DEFAULT_MIN_COL_SEPARATOR,
                  text_white_frac=DEFAULT_TEXT_WHITE_FRAC,
                  text_run=DEFAULT_TEXT_RUN,
-                 image_run=DEFAULT_IMAGE_RUN,
-                 cell_blank_frac=DEFAULT_CELL_BLANK_FRAC):
+                 image_white_frac=DEFAULT_IMAGE_WHITE_FRAC,
+                 image_run=DEFAULT_IMAGE_RUN):
     """Detect grid cells in row-major order. Returns list[Cell] with row/col
     set to their position in the detected grid (row 0-indexed top to bottom,
-    col 0-indexed left to right). Cells that are entirely blank (missing,
-    e.g. a short last row) are omitted."""
+    col 0-indexed left to right).
+
+    Columns are detected once from the whole image (they share a consistent
+    white gutter), but each column's cells are then found *independently* by
+    scanning that column's own vertical strip top-to-bottom. This matters
+    because real storyboard grids are not always a rigid table: caption
+    length varies per cell, so one column's row boundaries commonly do not
+    line up with another column's -- forcing shared row coordinates across
+    columns would crop into the wrong cell's content. "Row" here is only a
+    reading-order index (top-to-bottom position within a column), not a
+    shared y-coordinate. A short last row (fewer cells than other rows) is
+    handled naturally: that column's scan just yields one fewer segment."""
     arr = np.array(image.convert("RGB"))
     gray = to_gray(arr)
 
     col_bands = detect_columns(gray, white_level, col_blank_frac, min_col_separator)
-
-    # Row boundaries are detected per-column and the column yielding the most
-    # rows is used as the canonical row structure. This matters when the last
-    # row is incomplete (fewer cells than other rows): a column that happens
-    # to be blank in that final row would otherwise terminate its scan early
-    # and miss the row entirely, while a column that *does* have a cell there
-    # correctly reports the full row count.
-    candidate_segments = [
-        compute_row_segments(gray, white_level, text_white_frac, text_run, image_run, x0=cx0, x1=cx1)
+    column_segments = [
+        compute_row_segments(gray, white_level, text_white_frac, text_run,
+                              image_white_frac, image_run, x0=cx0, x1=cx1)
         for (cx0, cx1) in col_bands
     ]
-    row_segments = max(candidate_segments, key=len, default=[])
+    n_rows = max((len(segs) for segs in column_segments), default=0)
 
     cells = []
-    for r, seg in enumerate(row_segments):
-        y0, y1, split_y = seg["y0"], seg["y1"], seg["split_y"]
+    for r in range(n_rows):
         for c, (x0, x1) in enumerate(col_bands):
-            if cell_is_empty(gray, y0, y1, x0, x1, white_level, cell_blank_frac):
+            segs = column_segments[c]
+            if r >= len(segs):
                 continue
+            y0, y1, split_y = segs[r]["y0"], segs[r]["y1"], segs[r]["split_y"]
             img_box = (x0, y0, x1, split_y)
             text_box = (x0, split_y, x1, y1)
             cells.append(Cell(row=r, col=c, img_box=img_box, text_box=text_box))
@@ -329,8 +353,8 @@ def build_thresholds(args):
         min_col_separator=args.min_col_separator,
         text_white_frac=args.text_white_frac,
         text_run=args.text_run,
+        image_white_frac=args.image_white_frac,
         image_run=args.image_run,
-        cell_blank_frac=args.cell_blank_frac,
     )
 
 
@@ -351,8 +375,8 @@ def main():
     parser.add_argument("--min-col-separator", type=int, default=DEFAULT_MIN_COL_SEPARATOR)
     parser.add_argument("--text-white-frac", type=float, default=DEFAULT_TEXT_WHITE_FRAC)
     parser.add_argument("--text-run", type=int, default=DEFAULT_TEXT_RUN)
+    parser.add_argument("--image-white-frac", type=float, default=DEFAULT_IMAGE_WHITE_FRAC)
     parser.add_argument("--image-run", type=int, default=DEFAULT_IMAGE_RUN)
-    parser.add_argument("--cell-blank-frac", type=float, default=DEFAULT_CELL_BLANK_FRAC)
 
     args = parser.parse_args()
     input_dir = Path(args.input)
